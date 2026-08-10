@@ -1,0 +1,135 @@
+name: build
+
+# Builds a merged XMLTV guide from iptv-org's grabbers, daily.
+#
+# This repo exists ONLY to run this job and hold its output. Nothing else lives here, and the
+# output is public TV listings scraped from public broadcaster sites — no credentials, no
+# playlists, no application code.
+#
+# WHY IT IS PUBLIC. Grabbing all ~180,000 channels takes roughly 700 build-minutes a day. Private
+# repos get ~66 free minutes a day, so the full set is only affordable on a public repo, where
+# Actions minutes are unlimited. That is the entire reason.
+#
+# SHARDED, NOT HARDCODED. The site list is read from iptv-org at runtime and split across 20
+# parallel jobs by index, so it follows their repo as sites are added or removed and never needs
+# editing here. Wall-clock is ~1/20th of the total.
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+jobs:
+  grab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false           # a dead site must never lose the other shards
+      max-parallel: 20
+      matrix:
+        shard: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: iptv-org/epg, ref: master, path: epg-tool }
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - name: Install
+        working-directory: epg-tool
+        run: npm install --no-audit --no-fund
+      - name: Select this shard's sites
+        id: pick
+        working-directory: epg-tool
+        run: |
+          # Every 20th site, offset by shard index — an even split without needing to know the
+          # total, and stable as long as the directory listing is sorted.
+          SITES=$(ls sites | sort | awk "NR % 20 == ${{ matrix.shard }}" | paste -sd, -)
+          echo "sites=$SITES" >> "$GITHUB_OUTPUT"
+          echo "shard ${{ matrix.shard }}: $(echo $SITES | tr ',' '\n' | wc -l) sites"
+      - name: Grab
+        working-directory: epg-tool
+        continue-on-error: true
+        run: |
+          npm run grab -- --sites="${{ steps.pick.outputs.sites }}" \
+            --maxConnections=20 --days=2 --timeout=30000 \
+            --output=guide.xml || echo "partial output kept"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: guide-${{ matrix.shard }}
+          path: epg-tool/guide.xml
+          if-no-files-found: warn
+          retention-days: 1
+
+  publish:
+    needs: grab
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: self, fetch-depth: 1 }
+      - uses: actions/download-artifact@v4
+        with: { path: parts, pattern: guide-* }
+      - name: Merge
+        id: merge
+        run: |
+          python3 - <<'PY'
+          import glob, re, io
+          # Streaming text merge, not a DOM parse: combined input is hundreds of MB and lxml would
+          # exhaust the runner. XMLTV is a flat <tv> of <channel>/<programme>, so concatenation is
+          # sound; channel ids are deduped because shards overlap on shared channels.
+          seen, n_ch, n_pr = set(), 0, 0
+          out = io.open('merged.xml','w',encoding='utf-8')
+          out.write('<?xml version="1.0" encoding="UTF-8"?>\n<tv>\n')
+          files = sorted(glob.glob('parts/**/guide.xml', recursive=True))
+          print('shards merged:', len(files))
+          for f in files:
+              body = io.open(f,encoding='utf-8',errors='ignore').read()
+              for m in re.finditer(r'<channel\b.*?</channel>', body, re.S):
+                  cid = re.search(r'id="([^"]*)"', m.group(0))
+                  k = cid.group(1) if cid else m.group(0)[:60]
+                  if k in seen: continue
+                  seen.add(k); out.write(m.group(0)+'\n'); n_ch += 1
+              for m in re.finditer(r'<programme\b.*?</programme>', body, re.S):
+                  out.write(m.group(0)+'\n'); n_pr += 1
+          out.write('</tv>\n'); out.close()
+          print(f'channels={n_ch} programmes={n_pr}')
+          # Trailing newline matters: `read` returns non-zero at EOF without one and `bash -e`
+          # then kills the step AFTER it has succeeded.
+          open('counts.txt','w').write(f'{n_ch} {n_pr}\n')
+          PY
+          read CH PR < counts.txt || true
+          echo "channels=$CH"   >> "$GITHUB_OUTPUT"
+          echo "programmes=$PR" >> "$GITHUB_OUTPUT"
+          echo "merged: $CH channels / $PR programmes"
+      - name: Verify
+        run: |
+          read CH PR < counts.txt || true
+          # Partial is fine; empty must never replace a good guide.
+          if [ "$PR" -lt 20000 ]; then echo "only $PR programmes — refusing to publish"; exit 1; fi
+          gzip -9 -c merged.xml > merged.xml.gz
+          ls -la merged.xml.gz
+      - name: Publish
+        run: |
+          cd "$GITHUB_WORKSPACE/self"
+          git config user.name  "bot"
+          git config user.email "bot@users.noreply.github.com"
+          # Orphan + force-push: the guide is regenerated daily and disposable, so history would
+          # grow the repo by its own size every day.
+          git checkout --orphan d-tmp
+          git rm -rf --cached . >/dev/null 2>&1 || true
+          mkdir -p d
+          cp "$GITHUB_WORKSPACE/merged.xml.gz" d/guide.xml.gz
+          { echo "generated: $(date -u +%FT%TZ)"
+            echo "channels:   ${{ steps.merge.outputs.channels }}"
+            echo "programmes: ${{ steps.merge.outputs.programmes }}"; } > d/info.txt
+          git add -f d
+          git commit -q -m "${{ steps.merge.outputs.programmes }} programmes / ${{ steps.merge.outputs.channels }} channels"
+          git push -f origin d-tmp:data
+          echo published
