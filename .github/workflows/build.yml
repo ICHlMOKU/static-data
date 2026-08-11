@@ -151,6 +151,19 @@ jobs:
               for ch in k.encode():
                   h ^= ch; h = (h * 0x01000193) & 0xffffffff
               return format(h & 0xff, '02x')
+          def to_utc(ts):
+              # "20260811210500 +0200" -> "20260811190500". Truncating to 14 chars threw the
+              # offset away and the client reads the digits as UTC, so every programme was
+              # shifted by its source country's offset — channels "had" a guide with nothing
+              # covering NOW (measured: SPORTSNET 360, 36 progs, zero spanning now; correct
+              # after normalising). Times are normalised to UTC HERE, once, at build.
+              import datetime as _dt
+              m = re.match(r'(\d{14})\s*([+-])(\d{2})(\d{2})', ts)
+              if not m: return ts[:14]
+              t = _dt.datetime.strptime(m.group(1), '%Y%m%d%H%M%S')
+              delta = _dt.timedelta(hours=int(m.group(3)), minutes=int(m.group(4)))
+              t = t - delta if m.group(2) == '+' else t + delta
+              return t.strftime('%Y%m%d%H%M%S')
 
           # iptv-org shards FIRST (broadcaster guides), epg.pw LAST — first-writer-wins.
           files = sorted(glob.glob('parts/**/guide.xml', recursive=True)) \
@@ -175,7 +188,7 @@ jobs:
                   t = re.search(r'<title[^>]*>(.*?)</title>', inner, re.S)
                   d = re.search(r'<desc[^>]*>(.*?)</desc>', inner, re.S)
                   clean = lambda x: re.sub(r'<[^>]+>', '', x.group(1)).strip()[:400] if x else ''
-                  progs[cid.group(1)].append([st.group(1)[:14], sp.group(1)[:14], clean(t), clean(d)])
+                  progs[cid.group(1)].append([to_utc(st.group(1)), to_utc(sp.group(1)), clean(t), clean(d)])
                   n_pr += 1
 
           # Buckets: coreName -> programmes. First writer wins per key; programmes deduped by
