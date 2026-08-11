@@ -16,7 +16,13 @@ name: build
 
 on:
   schedule:
-    - cron: '0 3 * * *'
+    # 04:23, NOT 03:00. In the first two days of this repo's life the schedule fired exactly zero
+    # times — every one of the 12 runs on record was workflow_dispatch — while the cron sat
+    # correctly on the default branch, which is the one placement that would explain it. What is
+    # left is GitHub's own documented behaviour: scheduled workflows are best-effort and are
+    # dropped under load, and the top of the hour is when every cron on the platform fires at
+    # once. An odd minute well off the hour is the standard remedy.
+    - cron: '23 4 * * *'
   workflow_dispatch:
 
 permissions:
@@ -117,6 +123,30 @@ jobs:
         with: { path: self, fetch-depth: 1 }
       - uses: actions/download-artifact@v4
         with: { path: parts, pattern: guide-* }
+
+      # WHICH SHARDS ACTUALLY CAME BACK. Every grab is `continue-on-error`, so a shard that dies
+      # contributes nothing and says nothing — the run still shows a green tick. Until now the
+      # only trace was a guide quietly missing a few thousand channels. Name the missing ones.
+      - name: Account for the shards
+        run: |
+          EXPECTED=16
+          echo "shard  channels"
+          TOTAL=0; PRESENT=0; MISSING=""
+          for i in $(seq 0 $((EXPECTED-1))); do
+            f="parts/guide-$i/guide.xml"
+            if [ -s "$f" ]; then
+              n=$(grep -c '<programme ' "$f" 2>/dev/null || echo 0)
+              printf '%5s  %s programmes\n' "$i" "$n"
+              TOTAL=$((TOTAL+n)); PRESENT=$((PRESENT+1))
+            else
+              printf '%5s  MISSING\n' "$i"
+              MISSING="$MISSING $i"
+            fi
+          done
+          echo "shards present: $PRESENT/$EXPECTED, $TOTAL programmes before merge"
+          if [ -n "$MISSING" ]; then
+            echo "::warning::shards failed or produced nothing:$MISSING — the guide will be short by whatever they cover. The regression gate below decides whether it is publishable."
+          fi
 
       # epg.pw is DOWNLOADED, not scraped — it already publishes XMLTV. Folding it in here is
       # what lets the apps stop pulling 42+19MB per device from /epg/1 + /epg/2.
@@ -257,7 +287,7 @@ jobs:
           echo "programmes=$PR" >> "$GITHUB_OUTPUT"
           echo "bytes=$BYTES"   >> "$GITHUB_OUTPUT"
 
-      - name: Gate — never publish an empty or oversized build
+      - name: Gate — never publish an empty, oversized, or REGRESSED build
         run: |
           read CH PR BYTES < counts.txt || true
           # Partial is fine; EMPTY must never replace a good guide.
@@ -266,6 +296,49 @@ jobs:
           # billing safety net — hold the line well inside it.
           if [ "$BYTES" -gt 524288000 ]; then echo "$BYTES bytes of buckets — refusing"; exit 1; fi
           du -sh d/b d/alias.json.gz
+
+          # ── REGRESSION GATE ────────────────────────────────────────────────────────────────
+          # The floor above is ABSOLUTE, and that is the hole this closes. Every grab is
+          # `continue-on-error` (rightly — one dead site must not lose the other fifteen shards),
+          # so a run where half the shards fail still produces a valid, well-formed, much smaller
+          # guide, sails past a 20,000-programme floor, and silently replaces a good one. Nothing
+          # anywhere notices.
+          #
+          # MEASURED 2026-08-12, which is what prompted this: the live guide advertised 40,925
+          # channels, yet Canal Decasa had 0 programmes in its bucket while the older, far smaller
+          # /epg/3 build had 120 for it. Channels are going missing between runs and the only
+          # reason anyone found out was a user noticing a blank row on a TV.
+          #
+          # So compare against what is ALREADY PUBLISHED and refuse to go significantly backwards.
+          # 80% is deliberately loose: upstream sites genuinely come and go, and this must not
+          # become a tripwire that blocks a legitimately smaller day. It catches the cliff, not
+          # the drift.
+          #
+          # A missing or unreachable manifest is NOT a failure — first run, or a network blip at
+          # exactly the wrong moment, must never discard a 57-minute build. It warns and passes.
+          curl -sL --max-time 30 -o live.json https://epg.claritytv.app/manifest.json || true
+          python3 - "$CH" "$PR" <<'PY'
+          import json, os, sys
+          new_ch, new_pr = int(sys.argv[1]), int(sys.argv[2])
+          try:
+              live = json.load(open('live.json'))
+              live_ch, live_pr = int(live['channels']), int(live['programmes'])
+          except Exception as e:
+              print(f'::warning::no published manifest to compare against ({e}) — regression gate skipped')
+              sys.exit(0)
+          print(f'published: {live_ch:,} channels / {live_pr:,} programmes')
+          print(f'this run : {new_ch:,} channels / {new_pr:,} programmes')
+          bad = []
+          for label, new, old in (('channels', new_ch, live_ch), ('programmes', new_pr, live_pr)):
+              if old > 0 and new < old * 0.80:
+                  bad.append(f'{label} fell {100*(old-new)/old:.0f}% ({old:,} -> {new:,})')
+          if bad:
+              print('::error::REFUSING TO PUBLISH — ' + '; '.join(bad))
+              print('Almost certainly failed shards. Check the grab jobs above: each one that')
+              print('errored kept going by design, so the loss is silent unless caught here.')
+              sys.exit(1)
+          print('regression gate passed')
+          PY
 
       # Guarded on the secret existing, so the workflow keeps working (git publish below) before
       # the token is configured. Cache-Control is set HERE because it must survive re-publishes.
