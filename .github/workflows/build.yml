@@ -32,7 +32,10 @@ jobs:
     timeout-minutes: 330
     strategy:
       fail-fast: false           # a dead site must never lose the other shards
-      max-parallel: 20
+      # 8, not 20. Runs kept ending 'cancelled' or sitting pending with zero jobs scheduled,
+      # which is what hitting the account's concurrent-job ceiling looks like. Fewer parallel jobs
+      # is slower in wall-clock and identical in billed minutes.
+      max-parallel: 8
       matrix:
         shard: [0,1,2,3,4,5]
     steps:
