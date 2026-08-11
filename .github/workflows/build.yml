@@ -77,9 +77,20 @@ jobs:
           import os, glob, re, collections
           MAXSITE = 16000
           counts = collections.Counter()
+          # KEY THE BINS ON THE FILE PATH, NOT THE BASENAME.
+          #
+          # This used to key on os.path.basename(f).replace('.channels.xml',''), producing names
+          # like "sat.tv_ar", and pass those to --sites. grab.ts line 185 turns --sites=X into the
+          # glob sites/X/*.channels.xml, so it looked for a directory called "sat.tv_ar" — which
+          # does not exist. The real layout is sites/sat.tv/sat.tv_ar.channels.xml: one directory
+          # per site, one file per language variant.
+          #
+          # The grabber then logged "found 0 channel(s)", exited [success], wrote no guide.xml,
+          # and continue-on-error kept the job green. MEASURED 2026-08-12: shards 0, 1, 2, 5 and
+          # 15 produced NOTHING (5 of 16), shard 3 returned 732 programmes for 9,003 channels, and
+          # every one of them reported success. That is where the guide's missing channels went.
           for f in glob.glob('sites/*/*.channels.xml'):
-              site = os.path.basename(f).replace('.channels.xml','')
-              counts[site] += len(re.findall(r'<channel ', open(f, encoding='utf-8', errors='ignore').read()))
+              counts[f] += len(re.findall(r'<channel ', open(f, encoding='utf-8', errors='ignore').read()))
           usable = [(n, c) for n, c in counts.items() if 0 < c <= MAXSITE]
           usable.sort(key=lambda x: -x[1])
           N = 16
@@ -88,9 +99,13 @@ jobs:
               i = load.index(min(load))
               bins[i].append(name); load[i] += c
           idx = int(os.environ['SHARD'])
-          print(','.join(bins[idx]))
+          # --channels takes a GLOB (grab.ts:193 -> storage.list). A brace list names the exact
+          # files this shard owns; a single path must not be braced, since a one-item brace is not
+          # portable across glob implementations.
+          paths = bins[idx]
+          print(paths[0] if len(paths) == 1 else '{' + ','.join(paths) + '}')
           import sys
-          print(f'shard {idx}: {len(bins[idx])} sites, {load[idx]} channels '
+          print(f'shard {idx}: {len(bins[idx])} channel files, {load[idx]} channels '
                 f'(skipped {len([1 for n,c in counts.items() if c > MAXSITE])} oversized)',
                 file=sys.stderr)
           PY2
@@ -101,11 +116,22 @@ jobs:
 
       - name: Grab
         working-directory: epg-tool
-        continue-on-error: true
+        continue-on-error: true      # a dead site must never lose the other fifteen shards
         run: |
-          npm run grab -- --sites="${{ steps.pick.outputs.sites }}" \
+          # --channels, NOT --sites. See the note in the selector above: --sites globs
+          # sites/<name>/*.channels.xml and our names are per-FILE, so it matched nothing for
+          # every site with language variants.
+          npm run grab -- --channels="${{ steps.pick.outputs.sites }}" \
             --maxConnections=20 --days=1 --timeout=30000 \
-            --output=guide.xml || echo "partial output kept"
+            --output=guide.xml || echo "grab exited non-zero — keeping whatever it wrote"
+          # "found 0 channel(s)" is a SUCCESSFUL exit from the grabber, so the exit code above
+          # cannot be trusted to mean anything. Check the artefact itself: an empty shard is a
+          # real failure and must say so, even though continue-on-error keeps the run alive.
+          if [ ! -s guide.xml ]; then
+            echo "::error::shard ${{ matrix.shard }} produced NO guide.xml for --channels=${{ steps.pick.outputs.sites }}"
+            exit 1
+          fi
+          echo "shard ${{ matrix.shard }}: $(grep -c '<programme ' guide.xml) programmes"
       - uses: actions/upload-artifact@v4
         with:
           name: guide-${{ matrix.shard }}
