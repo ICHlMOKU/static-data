@@ -1,0 +1,31 @@
+# 30-second proof that the R2 S3 credentials work, so a broken token is found here
+# instead of at the end of a 57-minute build. Manual trigger only.
+name: r2-check
+
+on:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_S3_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_S3_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+      R2_ENDPOINT: https://5e40eadca69a1af57130c46c7436ac8d.r2.cloudflarestorage.com
+    steps:
+      - name: List, write, read back, clean up
+        run: |
+          set -e
+          echo "── list (read permission)"
+          aws s3 ls s3://claritytv-epg/ --endpoint-url "$R2_ENDPOINT"
+          echo "── write (write permission)"
+          echo "r2-check ok" > probe.txt
+          aws s3 cp probe.txt s3://claritytv-epg/_r2check.txt --endpoint-url "$R2_ENDPOINT" --only-show-errors
+          echo "── read back"
+          aws s3 cp s3://claritytv-epg/_r2check.txt - --endpoint-url "$R2_ENDPOINT"
+          echo "── delete the probe"
+          aws s3 rm s3://claritytv-epg/_r2check.txt --endpoint-url "$R2_ENDPOINT"
+          echo "R2 S3 CREDENTIALS OK"
