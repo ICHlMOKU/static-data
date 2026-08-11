@@ -74,7 +74,7 @@ jobs:
 
   publish:
     needs: grab
-    if: always()
+    if: always()                     # publish whatever shards DID succeed
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -82,128 +82,166 @@ jobs:
         with: { path: self, fetch-depth: 1 }
       - uses: actions/download-artifact@v4
         with: { path: parts, pattern: guide-* }
-      - name: Merge
+
+      # epg.pw is DOWNLOADED, not scraped — it already publishes XMLTV. Folding it in here is
+      # what lets the apps stop pulling 42+19MB per device from /epg/1 + /epg/2.
+      # Ordering matters below: iptv-org shard files merge FIRST, so real broadcaster guides win
+      # over epg.pw wherever both carry a channel (first-writer-wins per key).
+      - name: Fetch epg.pw feeds
+        continue-on-error: true      # epg.pw being down must not lose the grabbed shards
+        run: |
+          mkdir -p epgpw
+          curl -sL --max-time 300 -o epgpw/global.xml.gz https://epg.pw/xmltv/epg.xml.gz || true
+          curl -sL --max-time 300 -o epgpw/us.xml.gz     https://epg.pw/xmltv/epg_US.xml.gz || true
+          for f in epgpw/*.gz; do gzip -dc "$f" > "${f%.gz}" 2>/dev/null || rm -f "$f"; done
+          ls -la epgpw/ || true
+
+      - name: Fetch iptv-org channel database (for the alias dictionary)
+        continue-on-error: true
+        run: curl -sL --max-time 120 -o channels.json https://iptv-org.github.io/api/channels.json || true
+
+      - name: Merge, bucket, alias, manifest
         id: merge
         run: |
           python3 - <<'PY'
-          import glob, re, io
-          # Streaming text merge, not a DOM parse: combined input is hundreds of MB and lxml would
-          # exhaust the runner. XMLTV is a flat <tv> of <channel>/<programme>, so concatenation is
-          # sound; channel ids are deduped because shards overlap on shared channels.
-          seen, n_ch, n_pr = set(), 0, 0
-          out = io.open('merged.xml','w',encoding='utf-8')
-          out.write('<?xml version="1.0" encoding="UTF-8"?>\n<tv>\n')
-          files = sorted(glob.glob('parts/**/guide.xml', recursive=True))
-          print('shards merged:', len(files))
-          for f in files:
-              body = io.open(f,encoding='utf-8',errors='ignore').read()
-              for m in re.finditer(r'<channel\b.*?</channel>', body, re.S):
-                  cid = re.search(r'id="([^"]*)"', m.group(0))
-                  k = cid.group(1) if cid else m.group(0)[:60]
-                  if k in seen: continue
-                  seen.add(k); out.write(m.group(0)+'\n'); n_ch += 1
-              for m in re.finditer(r'<programme\b.*?</programme>', body, re.S):
-                  out.write(m.group(0)+'\n'); n_pr += 1
-          out.write('</tv>\n'); out.close()
-          print(f'channels={n_ch} programmes={n_pr}')
-          # Trailing newline matters: `read` returns non-zero at EOF without one and `bash -e`
-          # then kills the step AFTER it has succeeded.
-          open('counts.txt','w').write(f'{n_ch} {n_pr}\n')
-          PY
-          read CH PR < counts.txt || true
-          echo "channels=$CH"   >> "$GITHUB_OUTPUT"
-          echo "programmes=$PR" >> "$GITHUB_OUTPUT"
-          echo "merged: $CH channels / $PR programmes"
-      - name: Verify
-        run: |
-          read CH PR < counts.txt || true
-          # Partial is fine; empty must never replace a good guide.
-          if [ "$PR" -lt 20000 ]; then echo "only $PR programmes — refusing to publish"; exit 1; fi
-          # UPPER bound too. An oversized guide is not a better guide: 812MB of XML gets the
-          # Apple TV killed by tvOS rather than merely slowed, so refuse to ship one.
-          if [ "$PR" -gt 400000 ]; then echo "$PR programmes is too large for the client — trim the site list"; exit 1; fi
-          gzip -9 -c merged.xml > merged.xml.gz
-          ls -la merged.xml.gz
-      - name: Split into per-channel buckets
-        run: |
-          python3 - <<'PY2'
-          import re, io, json, os, gzip, collections
-          # WHY BUCKETS. Shipping the whole guide to every device does not scale: the full grab is
-          # 812MB of XML and tvOS kills the app long before that. Bucketing lets a client ask for
-          # ONE channel and receive ~2KB, so coverage stops being limited by device memory.
-          #
-          # 256 buckets keyed by FNV-1a(coreName) & 0xff. NOT md5: Cloudflare Workers' SubtleCrypto
-          # has no MD5, so the worker cannot reproduce an md5 bucket and every lookup would silently
-          # return "no programmes". This function is duplicated in worker.js /epg/ch and the two must
-          # never diverge. Buckets rather than one file per channel because 80k files is a repo
-          # nobody can clone; 256 is small, cacheable, ~300KB each.
-          def bucket_of(k):
-              h = 0x811c9dc5
-              for ch in k.encode():
-                  h ^= ch; h = (h * 0x01000193) & 0xffffffff
-              return format(h & 0xff, '02x')
-          def core(s):
+          import glob, re, io, json, os, gzip, collections, datetime
+          # ── shared with worker.js /epg/ch and both apps — MUST NOT DIVERGE ──
+          def corename(s):
               s = s.lower()
               s = re.sub(r'\b(uk|us|ca|de|it|fr|es|pt|nl|au|nz)\b[:|]*', ' ', s)
               s = re.sub(r'\b(hd|sd|fhd|uhd|4k|8k|hdr|plus|tv|channel)\b', ' ', s)
               return re.sub(r'[^a-z0-9]', '', s)
-          body = io.open('merged.xml', encoding='utf-8', errors='ignore').read()
-          # id -> display names
-          names = {}
-          for m in re.finditer(r'<channel\b[^>]*id="([^"]+)"(.*?)</channel>', body, re.S):
-              cid, inner = m.group(1), m.group(2)
-              names[cid] = re.findall(r'<display-name[^>]*>([^<]+)', inner) or [cid]
-          progs = collections.defaultdict(list)
-          for m in re.finditer(r'<programme\b([^>]*)>(.*?)</programme>', body, re.S):
-              at, inner = m.group(1), m.group(2)
-              cid = re.search(r'channel="([^"]+)"', at)
-              st  = re.search(r'start="([^"]+)"', at)
-              sp  = re.search(r'stop="([^"]+)"', at)
-              if not (cid and st and sp): continue
-              t = re.search(r'<title[^>]*>(.*?)</title>', inner, re.S)
-              d = re.search(r'<desc[^>]*>(.*?)</desc>', inner, re.S)
-              def clean(x):
-                  if not x: return ''
-                  return re.sub(r'<[^>]+>', '', x.group(1)).strip()[:400]
-              progs[cid.group(1)].append([st.group(1)[:14], sp.group(1)[:14], clean(t), clean(d)])
-          buckets = collections.defaultdict(dict)
-          n_keys = 0
+          def bucket_of(k):          # FNV-1a & 0xff — never md5 (Workers has no MD5)
+              h = 0x811c9dc5
+              for ch in k.encode():
+                  h ^= ch; h = (h * 0x01000193) & 0xffffffff
+              return format(h & 0xff, '02x')
+
+          # iptv-org shards FIRST (broadcaster guides), epg.pw LAST — first-writer-wins.
+          files = sorted(glob.glob('parts/**/guide.xml', recursive=True)) \
+                + sorted(glob.glob('epgpw/*.xml'))
+          print('merging', len(files), 'files:', [f.split("/")[-2:][0] for f in files])
+
+          names = {}                                  # channel id -> display names
+          progs = collections.defaultdict(list)       # channel id -> [[start,stop,title,desc]]
+          n_pr = 0
+          for f in files:
+              body = io.open(f, encoding='utf-8', errors='ignore').read()
+              for m in re.finditer(r'<channel\b[^>]*id="([^"]+)"(.*?)</channel>', body, re.S):
+                  cid = m.group(1)
+                  if cid not in names:
+                      names[cid] = re.findall(r'<display-name[^>]*>([^<]+)', m.group(2)) or [cid]
+              for m in re.finditer(r'<programme\b([^>]*)>(.*?)</programme>', body, re.S):
+                  at, inner = m.group(1), m.group(2)
+                  cid = re.search(r'channel="([^"]+)"', at)
+                  st  = re.search(r'start="([^"]+)"', at)
+                  sp  = re.search(r'stop="([^"]+)"', at)
+                  if not (cid and st and sp): continue
+                  t = re.search(r'<title[^>]*>(.*?)</title>', inner, re.S)
+                  d = re.search(r'<desc[^>]*>(.*?)</desc>', inner, re.S)
+                  clean = lambda x: re.sub(r'<[^>]+>', '', x.group(1)).strip()[:400] if x else ''
+                  progs[cid.group(1)].append([st.group(1)[:14], sp.group(1)[:14], clean(t), clean(d)])
+                  n_pr += 1
+
+          # Buckets: coreName -> programmes. First writer wins per key; programmes deduped by
+          # start time (the same channel id can appear in two source files).
+          buckets = collections.defaultdict(dict); n_keys = 0
           for cid, plist in progs.items():
-              if not plist: continue
-              plist.sort(key=lambda p: p[0])
+              seen_start, dedup = set(), []
+              for p in sorted(plist, key=lambda p: p[0]):
+                  if p[0] in seen_start: continue
+                  seen_start.add(p[0]); dedup.append(p)
               for nm in set(names.get(cid, [cid]) + [cid]):
-                  k = core(nm)
+                  k = corename(nm)
                   if len(k) < 3: continue
                   b = bucket_of(k)
                   if k not in buckets[b]:
-                      buckets[b][k] = plist; n_keys += 1
+                      buckets[b][k] = dedup; n_keys += 1
+
           os.makedirs('d/b', exist_ok=True)
           total = 0
           for b, data in buckets.items():
               raw = json.dumps(data, separators=(',', ':'), ensure_ascii=False).encode()
               with gzip.open(f'd/b/{b}.json.gz', 'wb', compresslevel=9) as f: f.write(raw)
               total += os.path.getsize(f'd/b/{b}.json.gz')
-          print(f'buckets={len(buckets)} keys={n_keys} total={total/1048576:.1f}MB '
-                f'avg={total/max(len(buckets),1)/1024:.0f}KB')
-          PY2
-          ls d/b | head -3; du -sh d/b
 
-      - name: Publish
+          # alias.json: iptv-org channels.json alt_names -> canonical coreKey, but ONLY aliases
+          # whose canonical key actually exists in the buckets — a dictionary entry pointing at
+          # nothing would send clients on a guaranteed-miss fetch.
+          all_keys = set()
+          for data in buckets.values(): all_keys.update(data)
+          alias, n_alias = {}, 0
+          try:
+              chdb = json.load(open('channels.json'))
+              for c in chdb:
+                  cn = corename(c.get('name') or '')
+                  if cn not in all_keys: continue
+                  for alt in (c.get('alt_names') or []):
+                      ak = corename(alt)
+                      if len(ak) >= 3 and ak != cn and ak not in all_keys and ak not in alias:
+                          alias[ak] = cn; n_alias += 1
+          except Exception as e:
+              print('alias build skipped:', e)
+          with gzip.open('d/alias.json.gz', 'wb', compresslevel=9) as f:
+              f.write(json.dumps(alias, separators=(',', ':'), ensure_ascii=False).encode())
+
+          # manifest.json — small, short-cached, and the FLEET KILL SWITCH: set enabled=false
+          # here (one R2 upload) and every app stops fetching buckets within its manifest TTL.
+          json.dump({'version': 2, 'enabled': True,
+                     'generated': datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+                     'channels': n_keys, 'programmes': n_pr, 'aliases': n_alias},
+                    open('d/manifest.json', 'w'))
+
+          print(f'keys={n_keys} programmes={n_pr} aliases={n_alias} bucketMB={total/1048576:.1f}')
+          open('counts.txt', 'w').write(f'{n_keys} {n_pr} {total}\n')
+          PY
+          read CH PR BYTES < counts.txt || true
+          echo "channels=$CH"   >> "$GITHUB_OUTPUT"
+          echo "programmes=$PR" >> "$GITHUB_OUTPUT"
+          echo "bytes=$BYTES"   >> "$GITHUB_OUTPUT"
+
+      - name: Gate — never publish an empty or oversized build
+        run: |
+          read CH PR BYTES < counts.txt || true
+          # Partial is fine; EMPTY must never replace a good guide.
+          if [ "$PR" -lt 20000 ]; then echo "only $PR programmes — refusing"; exit 1; fi
+          # An oversized build is a bug (or an upstream explosion), and the R2 free tier is the
+          # billing safety net — hold the line well inside it.
+          if [ "$BYTES" -gt 524288000 ]; then echo "$BYTES bytes of buckets — refusing"; exit 1; fi
+          du -sh d/b d/alias.json.gz
+
+      # Guarded on the secret existing, so the workflow keeps working (git publish below) before
+      # the token is configured. Cache-Control is set HERE because it must survive re-publishes.
+      # manifest.json gets 15 min so the kill switch propagates fast; buckets get 24 h.
+      - name: Upload to R2
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: 5e40eadca69a1af57130c46c7436ac8d
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+            echo "no CLOUDFLARE_API_TOKEN secret — skipping R2 upload (git publish still runs)"
+            exit 0
+          fi
+          npm install -g wrangler@4 >/dev/null 2>&1
+          for f in d/b/*.json.gz; do
+            wrangler r2 object put "claritytv-epg/b/$(basename "$f")" --file "$f" --remote \
+              --content-type application/gzip --cache-control "public, max-age=86400"
+          done
+          wrangler r2 object put claritytv-epg/alias.json.gz --file d/alias.json.gz --remote \
+            --content-type application/gzip --cache-control "public, max-age=86400"
+          wrangler r2 object put claritytv-epg/manifest.json --file d/manifest.json --remote \
+            --content-type application/json --cache-control "public, max-age=900"
+          echo "uploaded $(ls d/b | wc -l) buckets + alias + manifest to R2"
+
+      - name: Publish to the data branch (fallback + versioning)
         run: |
           cd "$GITHUB_WORKSPACE/self"
           git config user.name  "bot"
           git config user.email "bot@users.noreply.github.com"
-          # Orphan + force-push: the guide is regenerated daily and disposable, so history would
-          # grow the repo by its own size every day.
           git checkout --orphan d-tmp
           git rm -rf --cached . >/dev/null 2>&1 || true
-          mkdir -p d
-          cp -r "$GITHUB_WORKSPACE/d/b" d/b
-          cp "$GITHUB_WORKSPACE/merged.xml.gz" d/guide.xml.gz
-          { echo "generated: $(date -u +%FT%TZ)"
-            echo "channels:   ${{ steps.merge.outputs.channels }}"
-            echo "programmes: ${{ steps.merge.outputs.programmes }}"; } > d/info.txt
+          cp -r "$GITHUB_WORKSPACE/d" d
           git add -f d
-          git commit -q -m "${{ steps.merge.outputs.programmes }} programmes / ${{ steps.merge.outputs.channels }} channels"
+          git commit -q -m "${{ steps.merge.outputs.programmes }} programmes / ${{ steps.merge.outputs.channels }} keys"
           git push -f origin d-tmp:data
           echo published
