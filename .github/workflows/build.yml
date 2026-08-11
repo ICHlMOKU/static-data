@@ -236,6 +236,16 @@ jobs:
             --content-type application/json --cache-control "public, max-age=900"
           echo "uploaded $(ls d/b | wc -l) buckets + alias + manifest to R2"
 
+
+      # A silent nightly failure is the dangerous kind: the previous build stays live and looks
+      # fine for a day or two, then programmes simply run out. This makes the failure loud.
+      - name: Report failure
+        if: failure()
+        run: |
+          echo "::error::EPG build failed — the PREVIOUS guide stays live (publish never"\
+               "overwrites with an empty result), but it will go stale within ~2 days."
+          echo "Check: grab shards for old-TLS site errors, or the >=20k programme gate."
+
       - name: Publish to the data branch (fallback + versioning)
         run: |
           cd "$GITHUB_WORKSPACE/self"
