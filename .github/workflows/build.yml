@@ -124,6 +124,70 @@ jobs:
           if [ "$PR" -gt 400000 ]; then echo "$PR programmes is too large for the client — trim the site list"; exit 1; fi
           gzip -9 -c merged.xml > merged.xml.gz
           ls -la merged.xml.gz
+      - name: Split into per-channel buckets
+        run: |
+          python3 - <<'PY2'
+          import re, io, json, os, gzip, collections
+          # WHY BUCKETS. Shipping the whole guide to every device does not scale: the full grab is
+          # 812MB of XML and tvOS kills the app long before that. Bucketing lets a client ask for
+          # ONE channel and receive ~2KB, so coverage stops being limited by device memory.
+          #
+          # 256 buckets keyed by FNV-1a(coreName) & 0xff. NOT md5: Cloudflare Workers' SubtleCrypto
+          # has no MD5, so the worker cannot reproduce an md5 bucket and every lookup would silently
+          # return "no programmes". This function is duplicated in worker.js /epg/ch and the two must
+          # never diverge. Buckets rather than one file per channel because 80k files is a repo
+          # nobody can clone; 256 is small, cacheable, ~300KB each.
+          def bucket_of(k):
+              h = 0x811c9dc5
+              for ch in k.encode():
+                  h ^= ch; h = (h * 0x01000193) & 0xffffffff
+              return format(h & 0xff, '02x')
+          def core(s):
+              s = s.lower()
+              s = re.sub(r'\b(uk|us|ca|de|it|fr|es|pt|nl|au|nz)\b[:|]*', ' ', s)
+              s = re.sub(r'\b(hd|sd|fhd|uhd|4k|8k|hdr|plus|tv|channel)\b', ' ', s)
+              return re.sub(r'[^a-z0-9]', '', s)
+          body = io.open('merged.xml', encoding='utf-8', errors='ignore').read()
+          # id -> display names
+          names = {}
+          for m in re.finditer(r'<channel\b[^>]*id="([^"]+)"(.*?)</channel>', body, re.S):
+              cid, inner = m.group(1), m.group(2)
+              names[cid] = re.findall(r'<display-name[^>]*>([^<]+)', inner) or [cid]
+          progs = collections.defaultdict(list)
+          for m in re.finditer(r'<programme\b([^>]*)>(.*?)</programme>', body, re.S):
+              at, inner = m.group(1), m.group(2)
+              cid = re.search(r'channel="([^"]+)"', at)
+              st  = re.search(r'start="([^"]+)"', at)
+              sp  = re.search(r'stop="([^"]+)"', at)
+              if not (cid and st and sp): continue
+              t = re.search(r'<title[^>]*>(.*?)</title>', inner, re.S)
+              d = re.search(r'<desc[^>]*>(.*?)</desc>', inner, re.S)
+              def clean(x):
+                  if not x: return ''
+                  return re.sub(r'<[^>]+>', '', x.group(1)).strip()[:400]
+              progs[cid.group(1)].append([st.group(1)[:14], sp.group(1)[:14], clean(t), clean(d)])
+          buckets = collections.defaultdict(dict)
+          n_keys = 0
+          for cid, plist in progs.items():
+              if not plist: continue
+              plist.sort(key=lambda p: p[0])
+              for nm in set(names.get(cid, [cid]) + [cid]):
+                  k = core(nm)
+                  if len(k) < 3: continue
+                  b = bucket_of(k)
+                  if k not in buckets[b]:
+                      buckets[b][k] = plist; n_keys += 1
+          os.makedirs('d/b', exist_ok=True)
+          total = 0
+          for b, data in buckets.items():
+              raw = json.dumps(data, separators=(',', ':'), ensure_ascii=False).encode()
+              with gzip.open(f'd/b/{b}.json.gz', 'wb', compresslevel=9) as f: f.write(raw)
+              total += os.path.getsize(f'd/b/{b}.json.gz')
+          print(f'buckets={len(buckets)} keys={n_keys} total={total/1048576:.1f}MB '
+                f'avg={total/max(len(buckets),1)/1024:.0f}KB')
+          PY2
+          ls d/b | head -3; du -sh d/b
+
       - name: Publish
         run: |
           cd "$GITHUB_WORKSPACE/self"
@@ -134,6 +198,7 @@ jobs:
           git checkout --orphan d-tmp
           git rm -rf --cached . >/dev/null 2>&1 || true
           mkdir -p d
+          cp -r "$GITHUB_WORKSPACE/d/b" d/b
           cp "$GITHUB_WORKSPACE/merged.xml.gz" d/guide.xml.gz
           { echo "generated: $(date -u +%FT%TZ)"
             echo "channels:   ${{ steps.merge.outputs.channels }}"
