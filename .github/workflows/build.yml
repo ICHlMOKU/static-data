@@ -248,7 +248,12 @@ jobs:
       # Guarded on the secret existing, so the workflow keeps working (git publish below) before
       # the token is configured. Cache-Control is set HERE because it must survive re-publishes.
       # manifest.json gets 15 min so the kill switch propagates fast; buckets get 24 h.
+      # continue-on-error: an R2 credential problem must NOT discard a good build. On 2026-08-11
+      # a read-only token failed here and the data-branch publish below never ran, losing a
+      # 57-minute build with 39,609 keys. The branch copy is the fallback the client can be
+      # pointed at, so it must survive an upload failure.
       - name: Upload to R2
+        continue-on-error: true
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: 5e40eadca69a1af57130c46c7436ac8d
