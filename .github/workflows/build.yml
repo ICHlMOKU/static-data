@@ -34,7 +34,7 @@ jobs:
       fail-fast: false           # a dead site must never lose the other shards
       max-parallel: 20
       matrix:
-        shard: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]
+        shard: [0,1,2,3,4,5]
     steps:
       - uses: actions/checkout@v4
         with: { repository: iptv-org/epg, ref: master, path: epg-tool }
@@ -49,7 +49,13 @@ jobs:
         run: |
           # Every 20th site, offset by shard index — an even split without needing to know the
           # total, and stable as long as the directory listing is sorted.
-          SITES=$(ls sites | sort | awk "NR % 20 == ${{ matrix.shard }}" | paste -sd, -)
+          # CURATED, not all 537. Grabbing everything produced 80,558 channels /
+          # 1,514,194 programmes = 812MB of XML, and the Apple TV is killed by tvOS well
+          # before that: its 641MB footprint on a 109k-programme guide already trips the
+          # 900MB shed. Size is bounded by CHANNEL COUNT, so the fix is fewer sites, not
+          # fewer days. These cover the measured gaps (IT/ES/satellite/Balkans).
+          ALL="sat.tv_en,sat.tv_ar,superguidatv.it,guidatv.sky.it,movistarplus.es,programacion-tv.elpais.com,epg.iptvx.one,streamingtvguides.com,tv24.co.uk,m.tv.sms.cz,mi.tv_es,mi.tv_br,gatotv.com,tvtv.us"
+          SITES=$(echo "$ALL" | tr ',' '\n' | awk "NR % 6 == ${{ matrix.shard }}" | paste -sd, -)
           echo "sites=$SITES" >> "$GITHUB_OUTPUT"
           echo "shard ${{ matrix.shard }}: $(echo $SITES | tr ',' '\n' | wc -l) sites"
       - name: Grab
@@ -57,7 +63,7 @@ jobs:
         continue-on-error: true
         run: |
           npm run grab -- --sites="${{ steps.pick.outputs.sites }}" \
-            --maxConnections=20 --days=2 --timeout=30000 \
+            --maxConnections=20 --days=1 --timeout=30000 \
             --output=guide.xml || echo "partial output kept"
       - uses: actions/upload-artifact@v4
         with:
@@ -113,6 +119,9 @@ jobs:
           read CH PR < counts.txt || true
           # Partial is fine; empty must never replace a good guide.
           if [ "$PR" -lt 20000 ]; then echo "only $PR programmes — refusing to publish"; exit 1; fi
+          # UPPER bound too. An oversized guide is not a better guide: 812MB of XML gets the
+          # Apple TV killed by tvOS rather than merely slowed, so refuse to ship one.
+          if [ "$PR" -gt 400000 ]; then echo "$PR programmes is too large for the client — trim the site list"; exit 1; fi
           gzip -9 -c merged.xml > merged.xml.gz
           ls -la merged.xml.gz
       - name: Publish
