@@ -177,8 +177,17 @@ jobs:
               body = io.open(f, encoding='utf-8', errors='ignore').read()
               for m in re.finditer(r'<channel\b[^>]*id="([^"]+)"(.*?)</channel>', body, re.S):
                   cid = m.group(1)
-                  if cid not in names:
-                      names[cid] = re.findall(r'<display-name[^>]*>([^<]+)', m.group(2)) or [cid]
+                  # EVERY source's display-names, not just the first file to declare this id.
+                  # programmes[] below accumulates across all files while this used to be
+                  # first-writer-wins, and that asymmetry silently DELETED real channel names:
+                  # iptv-org calls a channel "V Sport 1", epg.pw calls the same id "V Sport", and
+                  # only the first survived — so the key "vsport" did not exist and every app
+                  # asking for "V SPORT" got nothing, even though the programmes were sitting
+                  # right there under "vsport1" (measured 2026-08-11: 16 programmes, identical).
+                  # A display-name is data a source actually published, so keeping all of them
+                  # adds match keys without inventing a single one.
+                  names.setdefault(cid, []).extend(
+                      re.findall(r'<display-name[^>]*>([^<]+)', m.group(2)))
               for m in re.finditer(r'<programme\b([^>]*)>(.*?)</programme>', body, re.S):
                   at, inner = m.group(1), m.group(2)
                   cid = re.search(r'channel="([^"]+)"', at)
