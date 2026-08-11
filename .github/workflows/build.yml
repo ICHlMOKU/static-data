@@ -29,15 +29,18 @@ concurrency:
 jobs:
   grab:
     runs-on: ubuntu-latest
-    timeout-minutes: 330
+    # MEASURED rate is ~75 channels/min, not the 170 first assumed (shard 14 did ~9k in 119min).
+    # Biggest kept site is ~15.5k channels ~= 207min, so 240 leaves headroom while staying well
+    # under GitHub's hard 6h kill — the thing that cancelled the 2026-08-10 run.
+    timeout-minutes: 240
     strategy:
       fail-fast: false           # a dead site must never lose the other shards
       # 8, not 20. Runs kept ending 'cancelled' or sitting pending with zero jobs scheduled,
       # which is what hitting the account's concurrent-job ceiling looks like. Fewer parallel jobs
       # is slower in wall-clock and identical in billed minutes.
-      max-parallel: 8
+      max-parallel: 16
       matrix:
-        shard: [0,1,2,3,4,5]
+        shard: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]
     steps:
       - uses: actions/checkout@v4
         with: { repository: iptv-org/epg, ref: master, path: epg-tool }
@@ -46,21 +49,50 @@ jobs:
       - name: Install
         working-directory: epg-tool
         run: npm install --no-audit --no-fund
-      - name: Select this shard's sites
+      - name: Select this shard's sites (balanced by channel count)
         id: pick
         working-directory: epg-tool
         run: |
-          # Every 20th site, offset by shard index — an even split without needing to know the
-          # total, and stable as long as the directory listing is sorted.
-          # CURATED, not all 537. Grabbing everything produced 80,558 channels /
-          # 1,514,194 programmes = 812MB of XML, and the Apple TV is killed by tvOS well
-          # before that: its 641MB footprint on a 109k-programme guide already trips the
-          # 900MB shed. Size is bounded by CHANNEL COUNT, so the fix is fewer sites, not
-          # fewer days. These cover the measured gaps (IT/ES/satellite/Balkans).
-          ALL="sat.tv_en,sat.tv_ar,superguidatv.it,guidatv.sky.it,movistarplus.es,programacion-tv.elpais.com,epg.iptvx.one,streamingtvguides.com,tv24.co.uk,m.tv.sms.cz,mi.tv_es,mi.tv_br,gatotv.com,tvtv.us"
-          SITES=$(echo "$ALL" | tr ',' '\n' | awk "NR % 6 == ${{ matrix.shard }}" | paste -sd, -)
+          # BIN-PACK BY SIZE, NOT BY ALPHABET.
+          #
+          # The first version split sites with `NR % N`, which is random with respect to how big
+          # each site is. Measured 2026-08-10: one shard drew a 15-19k-channel site, ran 330
+          # minutes and was KILLED by GitHub's 6-hour per-job limit — which is why the whole run
+          # ended 'cancelled' while most shards finished in 3-10 minutes.
+          #
+          # Greedy longest-processing-time: sort sites by channel count descending, hand each to
+          # whichever shard currently has the least work. Deterministic for a given shard index,
+          # and it keeps the slowest shard close to the average instead of 30x it.
+          #
+          # Sites above MAXSITE are SKIPPED entirely: a single site that large cannot finish
+          # inside the 6h job limit no matter how it is packed, so including it guarantees a
+          # cancelled run. They are mostly US listings, which epg.pw already covers.
+          python3 - <<'PY2' > shard_sites.txt
+          import os, glob, re, collections
+          MAXSITE = 16000
+          counts = collections.Counter()
+          for f in glob.glob('sites/*/*.channels.xml'):
+              site = os.path.basename(f).replace('.channels.xml','')
+              counts[site] += len(re.findall(r'<channel ', open(f, encoding='utf-8', errors='ignore').read()))
+          usable = [(n, c) for n, c in counts.items() if 0 < c <= MAXSITE]
+          usable.sort(key=lambda x: -x[1])
+          N = 16
+          load = [0]*N; bins = [[] for _ in range(N)]
+          for name, c in usable:
+              i = load.index(min(load))
+              bins[i].append(name); load[i] += c
+          idx = int(os.environ['SHARD'])
+          print(','.join(bins[idx]))
+          import sys
+          print(f'shard {idx}: {len(bins[idx])} sites, {load[idx]} channels '
+                f'(skipped {len([1 for n,c in counts.items() if c > MAXSITE])} oversized)',
+                file=sys.stderr)
+          PY2
+          SITES=$(cat shard_sites.txt)
           echo "sites=$SITES" >> "$GITHUB_OUTPUT"
-          echo "shard ${{ matrix.shard }}: $(echo $SITES | tr ',' '\n' | wc -l) sites"
+        env:
+          SHARD: ${{ matrix.shard }}
+
       - name: Grab
         working-directory: epg-tool
         continue-on-error: true
